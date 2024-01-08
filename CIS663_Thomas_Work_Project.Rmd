@@ -1,0 +1,927 @@
+---
+title: "An Analysis on US Senate Election Results Versus Income"
+author: "Thomas Gunner Work"
+date: "Dec. 4, 2023"
+bibliography: references.bib
+output:
+  # html_document:
+  #   theme: readable
+  #   toc: true
+  #   toc_float: true
+  word_document:
+    toc: true
+link-citations: yes
+csl: apa.csl
+---
+
+```{r packages, message=FALSE, warning=FALSE, echo=FALSE}
+library(car)        # for regression modeling
+library(caret)      # for modeling utility
+library(e1071)      # for machine learning models
+library(magrittr)   # forward pipe operator
+library(pander)     # for pleasant-looking tables
+library(tidyverse)  # for simpler syntax
+library(usmap)      # for plotting results to US maps
+```
+
+```{r options, echo=FALSE}
+options(scipen = 999)
+panderOptions('table.style', 'rmarkdown')
+```
+
+```{r senate, echo=FALSE}
+senate <- function(file) {
+  df <- read.csv(file, check.names = FALSE) %>% 
+    select(
+      c( 
+        "STATE ABBREVIATION", 
+        "DISTRICT", 
+        "CANDIDATE NAME", 
+        "PARTY", 
+        "GENERAL VOTES", 
+        "COMBINED GE PARTY TOTALS", 
+        "GE WINNER INDICATOR" 
+        )
+      )
+  
+  names(df) <- c("STATE", "S", "candidate", "party", 
+                 "ge_votes", "combined_ge_votes", "winner")
+  df %<>%
+    filter(ge_votes != "",str_detect(S, "S"),party != "", party != " ") %>% 
+    mutate(
+      ge_votes = as.numeric(gsub("[^0-9.]", "", ge_votes)),
+      combined_ge_votes = as.numeric(gsub("[^0-9.]", "", combined_ge_votes)),
+      ge_votes = ifelse(is.na(combined_ge_votes), ge_votes, combined_ge_votes),
+      year = as.integer(substring(file, nchar(file)-7, nchar(file)-4)),
+      party = ifelse(
+        (party == "WF" |                      #Working Families party, Democrat
+           substring(party, 1, 4) == "N(D)" | #Nonpartisan Democrat
+           substring(party, 1, 1) == "D") 
+        & party != "DTS",                     #Declined to Select - classified Republican
+        "D", 
+        "R")) %>%                             #All others grouped into Republican
+    distinct(candidate, .keep_all = TRUE) %>% 
+    select(year, STATE, party, ge_votes, winner)
+
+  return(
+    merge(
+      df %>% 
+        group_by(year, STATE, party) %>% 
+        summarise(
+          votes = sum(ge_votes),
+          .groups = "keep"),
+      df %>% 
+        filter(winner == "W") %>% 
+        select(STATE, party, winner), 
+      by = c("STATE", "party"), 
+      all.x = TRUE) %>% 
+      mutate(winner = as.factor(ifelse(is.na(winner), "DEM", "REP"))) %>% 
+      pivot_wider(
+        names_from = party, 
+        id_cols = c(year, STATE), 
+        values_from = c(votes, winner)) %>% 
+      as.data.frame() %>% 
+      rename(winner = winner_R) %>% 
+      mutate(
+        net_votes = votes_R - votes_D,
+        total_votes = rowSums(.[,c("votes_R", "votes_D")], na.rm = TRUE)) %>% 
+      select(year, STATE, net_votes, total_votes, winner)
+    )
+}
+```
+
+```{r agi, echo=FALSE}
+agi_des_stat <- function(df, val_col, cat_col, title=NULL) {
+  t_df <- 
+    rbind(
+      t(
+        do.call(
+          rbind, 
+          tapply(
+            df[[val_col]], 
+            df[[cat_col]], 
+            summary
+            )
+          )
+        ),
+      tapply(df[[val_col]], df[[cat_col]], sum)
+      )
+  
+  row.names(t_df) <- c("Min", "1Q", "Median", "Mean", "3Q", "Max", "Total")
+  
+  pander(t_df, digits = 3, big.mark = ",", justify = "right", caption = title)
+}
+```
+
+```{r t-tests, echo=FALSE}
+# Takes a data frame of one target variable (x) separated by a single factor (y)
+# and performs the proper test based on normality and variance.
+t_tests <- function(df, alpha, alt="two.sided") {
+  output <- function(samp1, samp2, tail, p.value) {
+    paste0(samp1," sample is",
+           ifelse(
+             p.value>alpha,
+             " not significantly ",
+             " significantly "),
+           ifelse(
+             tail=="two.sided",
+             "different",
+             tail),
+           " than ",samp2," sample. (p = ", p.value, ")")
+  }
+  message <- c()
+  x <- df[, sapply(df, is.numeric)]
+  y <- df[, sapply(df, is.factor )]
+  z <- split(x, y)
+  if (shapiro.test(z[[1]])[[2]] > alpha & shapiro.test(z[[2]])[[2]] > alpha) {
+    if (leveneTest(x, y)[[3]][1] > alpha) {
+      message %<>% c("Samples have equal variances.")
+      message %<>% c("Independent Samples T-Test")
+      result <- format(t.test(
+        z[[1]],
+        z[[2]],
+        var.equal=TRUE,
+        alternative=alt
+        )$p.value, digits = 2)
+      message %<>% c(output(names(z[1]), names(z[2]), alt, result))
+    } else {
+      message %<>% c("Samples have unequal variances.")
+      message %<>% c("Welch's Test")
+      result <- format(t.test(
+        z[[1]],
+        z[[2]],
+        var.equal=FALSE,
+        alternative=alt
+        )$p.value, digits = 2)
+      message %<>% c(output(names(z[1]), names(z[2]), alt, result))
+    }
+  } else {
+    message %<>% c("Mann-Whitney U (Wilcoxon Rank Sum) Test")
+    result <- format(wilcox.test(
+      z[[1]],
+      z[[2]],
+      alternative=alt
+      )$p.value, digits = 2)
+    message %<>% c(output(names(z[1]), names(z[2]), alt, result))
+  }
+  return(message)
+}
+```
+
+# Abstract
+
+This study investigates the relationship between US Senate elections and the states' corresponding federal income tax return data. We aim to assess which fields, if any, correlate with favoring one political party over another. Six election cycles (2010-2020) of corresponding Federal Elections Commission (FEC) Senate election results and Internal Revenue Service (IRS) federal individual income return data were analyzed.
+
+The [findings](#lm_sum) of this study show that voters' incomes account for 33% of the variance in election results (F = 50.59, df = 2, n = 199, p <<< 0.01). States with a larger population of impoverish households were shown to be more likely to elect Republican candidates. Conversely, as a state's wealthiest citizens' income increased, the more likely the state would elect a Democratic candidate. 
+
+Keywords: US elections, income, income inequality, regression analysis, support vector machine
+
+# Introduction
+
+A democracy is built upon the will of a government's citizens through free and open elections. The United States of America has been a democratic nation since its birth in 1776. Founded on the idea that its government would change and update regularly, the US has done so for nearly two hundred and fifty years. 
+
+In a 2020 study, 42% of respondents surveyed declared that reducing income inequality should be the government's top priority [@Horowitz_Igielnik_Kochhar_2020]. The study also showed that, in recent decades, economic growth has favored higher income households over all others. The "Great Recession" of 2008 further widened this gap, as did the CoVID-19 Pandemic [@piacentini2022impact]. As elections are often battlegrounds over income redistribution [@Filer_Kenny_Morton_1993], it is imperative to quantify income inequality as it relates to voting habits. 
+
+# Literature Review
+
+For over 60 years, the United States has been the richest country in the world in terms of gross domestic product and net worth [@Burgher_2023]. Yet even today, millions of Americans live in poverty. As citizens, Americans turn to their government to assist in solving such issues. They do this by democratically electing representatives to various political offices such as the US Congress, which consists of the House of Representatives and the Senate. These bodies are responsible for writing and passing laws in the United States, such as funding the federal government through various means such as taxation.
+
+Individual income tax currently accounts for over half of Federal US Government revenue [@Fiscal_Data_2023]. While studies have been conducted on ideal or maximum tax burden of individuals, more research is needed to inspect how taxable income can influence election results. This study seeks to do just that.
+
+In this study, we will first examine if and by how much (1) the number of households and (2) the aggregate AGI of a state's population influences US Senate election outcomes. Assuming one or both do, we will construct a model to predict this influence and analyze the strength and direction of each effect. We will then examine if and how *all* available fields from the IRS data influence elections and compare the results.
+
+# Data
+
+To begin this study, we gathered [FEC election results](https://www.fec.gov/introduction-campaign-finance/election-results-and-voting-information/) and [IRS individual return data](https://www.irs.gov/statistics/soi-tax-stats-individual-income-tax-statistics-zip-code-data-soi) from 2010 to 2020, resulting in 6 csv files from each website. Some manual pre-processing of the FEC election data files were required, as the sheets of the excel files for the election data were not uniform. This included manually extracting relevant sheets, changing column names, and adding missing columns for uniformity. All twelve files were also renamed to allow for their corresponding years to be identified in the resulting data schema. Election results and IRS data files were placed into folders named "Election Data" and "IRS Data", respectively.
+
+*Packages used can be seen [here](#packages).*
+
+## Senate Election Results
+
+Following the pre-processing of the data, we began with importing the election results using the following code:
+
+```{r Import Election Results}
+Election_Data <- 
+  bind_rows(
+    lapply(
+      list.files("Election Data", full.names = TRUE), 
+      senate # custom function
+      )
+    ) %>% filter(!is.na(net_votes), !is.na(winner))
+```
+
+*see [senate](#senate) for code breakdown*
+
+We continue by selecting the fields of interest and confirm that the correct records are kept. For example, the FEC data includes primary election results in addition to the general election results. As this paper is not concerned with primary election results, these are discarded. 2010 data was unique in that it did not separate out US House elections from US Senate elections, so we also needed to discard House results for this year. Some states only allow the top two primary election candidates to move on to the general election, which can result in both candidates belonging to the same party. These results were also excluded, as they did not allow for comparison between parties.
+
+While the US is host to many different political parties, only the Democratic and Republican parties hold significant office apart from one or two Independent candidates that predominantly align with the Democratic party. As this study is focused on Democrat versus Republican races, most candidates party affiliations needed to be reclassified. For simplicity, only those designations outlined in the [**senate**](#senate) function were classified as Democrat, while all others were classified as Republican. 
+
+As a result of this choice and of the way some states officiate their elections, some Democratic victories conflict with the election's net votes. While uncommon, this does in fact track with historical results. If one Democratic and two Republican candidates run for the same office, the Democratic candidate receive less than half of the votes, yet still receive more votes than either Republican candidate.
+
+### Descriptive Statistics of Election Data
+
+###### Table 1
+
+```{r Election Preview, echo=FALSE}
+pander(
+  head(Election_Data) %>% mutate(year = as.factor(year)), 
+  big.mark=",", 
+  caption="Election Data Preview",
+  justify = c("center", "center", "right", "right", "center"))
+```
+
+The resulting data frame lists the year, state, net votes, total votes, and winners of each election race. Net votes values, also referred to as "margin of victory", are calculated by the sum of Republican votes minus the sum of Democrat votes. "Total votes" values are the total number of ballots cast in the state's senate election, otherwise known as voter turnout. For the purposes of this study, "net votes" will be our numerical target/dependent variable, while "winner" will be our categorical target/dependent variable. 
+
+When plotting margin of victory versus voter turnout ([Figure 1](#figure1)), we see that Democratic candidates tend to win by a smaller margin ([Table 2](#margin_of_victory)) and tend to win with a larger voter turnout ([Table 3](#voter_turnout_table)).
+
+```{r Averages of Election Data, include=FALSE}
+mean_tot = mean(Election_Data$total_votes)
+mean_net = mean((Election_Data %>% mutate(net_votes = ifelse(
+                winner == "REP", net_votes, -net_votes)))$net_votes)
+```
+
+###### Figure 1 {#figure1}
+
+```{r MoV, echo=FALSE, warning=FALSE}
+ggplot(
+  Election_Data %>% 
+    mutate(
+      total_votes = total_votes/1e3, 
+      net_votes = ifelse(winner == "REP", net_votes, -net_votes)/1e3), 
+  aes(x=total_votes, y=net_votes)
+  ) +  
+  geom_vline(xintercept = mean_tot/1e3, 
+             linetype='dashed') +
+  geom_hline(yintercept = mean_net/1e3,
+             linetype='dashed') +
+  annotate("text", x=mean_tot/1e3-400, y=2500, 
+           label = "Mean Turnout", angle='90', size=2.5) +
+  annotate("text", x=10900, y=mean_net/1e3-100, 
+           label = "Mean Margin of Victory", size=2.5) +
+  facet_wrap(~winner) +
+  geom_point() + 
+  geom_smooth(formula = y~x, aes(color=winner), method = "lm", se=FALSE) +
+  scale_color_manual(values = c("REP" = "red", "DEM" = "blue")) +
+  labs(
+    title = "Victories by Party",
+    x = "Voter Turnout\n(Thousands)",
+    y = "Margin of Victory\n(Thousands of Votes)") +
+  theme(legend.position="None")
+```
+
+###### Table 2 {#margin_of_victory}
+
+```{r Net Votes by Party, echo=FALSE}
+df <- Election_Data %>% 
+  mutate(net_votes = ifelse(winner == "REP", net_votes, -net_votes))
+
+table <- 
+  t(cbind(
+    rbind(
+      tapply(df$net_votes, df$winner, summary)[[1]],
+      tapply(df$net_votes, df$winner, summary)[[2]], 
+      summary(df$net_votes)),
+    t(cbind(
+      t(summary(df$winner)),
+      nrow(df)
+      ))))
+
+colnames(table) <- c("DEM Victory", "REP Victory", "All Elections")
+rownames(table) <- c("Min", "1Q", "Median", "Mean", "3Q", "Max", "Count")
+
+pander(table, big.mark = ",", justify = "right", caption = "Margin of Victory by Party")
+```
+<br>
+
+```{r Net Votes by Party t-test, echo=FALSE}
+t_tests(
+  Election_Data %>% 
+    mutate(
+      net_votes = ifelse(
+        winner == "REP", 
+        net_votes, 
+        -net_votes)
+      ) %>% 
+    select(net_votes, winner), 
+  alpha = 0.05, 
+  "less")
+
+rm(table)
+```
+
+###### Table 3 {#voter_turnout_table}
+
+```{r Total Votes by Party, echo=FALSE}
+table <- 
+  t(cbind(
+    rbind(
+      tapply(df$total_votes, df$winner, summary)[[1]],
+      tapply(df$total_votes, df$winner, summary)[[2]], 
+      summary(df$total_votes)),
+    t(cbind(
+      t(summary(df$winner)),
+      nrow(df)
+      ))))
+
+colnames(table) <- c("Dem Victory", "REP Victory", "All Elections")
+rownames(table) <- c("Min", "1Q", "Median", "Mean", "3Q", "Max", "Count")
+
+pander(table, big.mark = ",", justify = "right", caption = "Voter Turnout by Party Victory")
+```
+
+
+```{r Total Votes by Party t-test, echo=FALSE}
+t_tests(
+  Election_Data %>% 
+    mutate(
+      net_votes = ifelse(
+        winner == "REP", 
+        net_votes, 
+        -net_votes)
+      ) %>% 
+    select(total_votes, winner), 
+  alpha = 0.05, 
+  "greater")
+
+rm(df, table)
+```
+
+*see [Independent Two Samples T-Test](#t-tests) code for t-test implementation*
+
+## Internal Revenue Service Individual Returns
+
+Next, we structured the IRS data. This data is aggregated by state and adjusted gross income (AGI) brackets to prevent the possibility of identifying specific individuals' identities. The data also includes a breakdown by ZIP code with state-wide data aggregated into ZIP code values of "00000".
+
+The IRS defines code 'N1' as the number of individual tax returns filed. This can include single filers and/or married filers. To avoid potential confusion, we will be calling this variable "households", as both single tax filers and married tax filers each would constitute a single "household".
+
+Code 'A00100' will be called "aggregate AGI" for the purposes of this study. As the IRS data is divided by each state's individual filers' AGI range and aggregated, this means that all filers with an AGI of over $200,000, for example, will share the same "aggregate AGI". As there are six "bins" by which the IRS divides its filers, there will therefore be six "aggregate AGIs" for each state.
+
+For this study, we will re-code the "agi_stub" field to the following:
+
+| IRS Code | New Code |         Description         |
+|----------|----------|:----------------------------|
+|    1     |    A     |AGIs between $1 and \$25k    |
+|    2     |    B     |AGIs between $25 and \$50k   |
+|    3     |    C     |AGIs between $50 and \$75k   |
+|    4     |    D     |AGIs between $75 and \$100k  |
+|    5     |    E     |AGIs between $100 and \$200k |
+|    6     |    F     |AGIs over $200k              |
+
+One thing to note: only individual tax returns with an adjusted gross income *over* \$1 are recorded here. This data excludes taxpayers whose taxable income was effectively \$0 or less.
+
+```{r Import IRS Data, cache=TRUE}
+common_fields <- 
+  Reduce(
+    intersect, 
+    lapply(
+      list.files("IRS Data", full.names = TRUE), 
+      function (x) {
+        names(
+          read.csv(x, nrows=1)
+          )}))
+
+rename_cols <- function(col_name) {
+  df <- read.csv("field_codes.csv")
+  ifelse(
+    col_name %in% df[[1]],
+    df[[2]][df[[1]]==col_name],
+    col_name)
+  }
+
+IRS_Data_raw <-
+  bind_rows(
+    lapply(
+      list.files("IRS Data", full.names = TRUE),
+      function (file) {
+        df <- read.csv(file) %>%
+          select(all_of(common_fields)) %>% 
+          mutate(
+            year = as.integer(substring(file, nchar(file)-7, nchar(file)-4)),
+            zipcode = sprintf("%05d", zipcode),
+            across(c(STATE, agi_stub), as.factor)) %>%
+          filter(zipcode == "00000") %>%
+          select(-zipcode, -STATEFIPS)
+
+        levels(df$agi_stub) <- 
+          c("A", 
+            "B", 
+            "C", 
+            "D", 
+            "E", 
+            "F")
+        return(df)
+      }))
+
+names(IRS_Data_raw) <- 
+  sapply(names(IRS_Data_raw), rename_cols)
+
+IRS_Data_sim <- IRS_Data_raw %>%
+  select(year, STATE, agi_stub, returns, adjust_gross_income)
+```
+
+### Descriptive Statistics of IRS Data
+
+As shown in the data frame preview below, we are left with year, state, AGI bracket, households, and aggregate AGI as our columns of interest.
+
+###### Table 4
+
+```{r IRS Data Preview, echo=FALSE}
+pander(
+  head(IRS_Data_sim) %>% mutate(year = as.factor(year)), 
+  big.mark=",",
+  caption = "Income Data Preview",
+  justify = c("center", "center", "left", "right", "right"))
+```
+
+[Figure 2](#figure2) and [Figure 3](#figure3) display the Kernel Density Estimates of the distributions of households and aggregate AGI, respectively. We can see that both the kurtosis and skewness of households tend to increase as we move up through AGI brackets, while the inverse is true for AGI totals. This shows that individuals with less financial worth far outnumber individuals with more.
+
+###### Figure 2 {#figure2}
+
+```{r Households by Bin Figure, echo=FALSE}
+ggplot(data = (IRS_Data_sim 
+       %>% mutate(returns=ifelse(returns>2e6, 2e6, returns)/1e3) 
+       %>% filter(returns<=2000)),
+       aes(
+         x=returns, 
+         y=after_stat(density))) + 
+  geom_histogram(bins=25, fill="orange", color="black", alpha=0.5) + 
+  geom_density(color="blue", linewidth = 0.6) +
+  facet_wrap(~agi_stub) +
+  labs(
+    title = "2010-2020 State Household Aggregrates",
+    subtitle = expression(italic("Excludes Non-Federal Election Years")),
+    x = "Number of Households\n(Thousands)",
+    y="",
+    caption = "Households over 2,000k consolidated for readability.") + 
+  theme_minimal()
+```
+
+###### Table 5
+
+```{r Households by Bin Table, echo=FALSE}
+agi_des_stat(
+  IRS_Data_sim %>% mutate(returns=returns/1e3), 
+  "returns", 
+  "agi_stub", 
+  title="Households by AGI Bracket (Thousands)")
+```
+
+###### Figure 3 {#figure3}
+
+```{r AGI by Bin Figure, echo=FALSE}
+ggplot(
+  IRS_Data_sim %>% 
+    mutate(
+      adjust_gross_income = ifelse(
+        adjust_gross_income>200e6, 
+        200e6, 
+        adjust_gross_income)/1e6) %>% 
+    filter(adjust_gross_income<=200),
+  aes(x=adjust_gross_income, y=after_stat(density))) + 
+  geom_histogram(bins=25, fill="green", color="black", alpha=0.5) + 
+  geom_density(color="red", linewidth = 0.6) +
+  facet_wrap(~agi_stub) +
+  labs(
+    title = "2010-2020 State AGI Aggregrates",
+    subtitle = expression(italic("Excludes Non-Federal Election Years")),
+    x = "Aggregate AGI\n($Billion)",
+    y="",
+    caption = "$200B+ consolidated for readability.") + 
+  theme_minimal()
+```
+
+###### Table 6
+
+```{r AGI by Bin Table, echo=FALSE}
+agi_des_stat(
+  IRS_Data_sim %>% mutate(adjust_gross_income = adjust_gross_income/1e6), 
+  "adjust_gross_income", 
+  "agi_stub", 
+  title="Aggregate AGI by AGI Bracket (in $Billion)")
+```
+
+## Merge Datasets
+
+```{r Merge Datasets}
+Sim_Data <- merge(
+  IRS_Data_sim %>%
+  pivot_wider(
+    names_from = agi_stub,
+    id_cols = c(STATE, year),
+    values_from = c(names(IRS_Data_sim[
+      !names(IRS_Data_sim) %in% c("STATE", "year", "agi_stub")
+      ]))) %>%
+  as.data.frame(),
+  Election_Data,
+  by = c("STATE", "year")
+)
+```
+
+Now that we have our two data frames cleaned, we are ready to combine them for analysis. To do this, we first need to pivot the IRS data frame to consolidate all variables into a single record. We then merge the two data frames on state and year, resulting in a new data frame with a state's election results and corresponding income data. Below is a preview of the resulting data frame:
+
+###### Table 7
+
+```{r Data Totals Preview, echo=FALSE}
+pander(
+  head(Sim_Data, 3), 
+  caption="Merged Data Preview")
+```
+
+# Methodology
+
+Next, we examine how the income data (independent/predictor variables) relates to the Senate election results (dependent/target variables). First, we will examine the impact of the independent variables on the margin of victory.
+
+## Multiple Regression
+
+To construct a multiple regression model, we must only pass independent variables of interest and a single target variable. We then pass the resulting data frame to the **lm** function.
+
+### Initial Model
+
+```{r Initialize Model}
+exclude_from_lm <- c("STATE", "total_votes", "winner", "year")
+                     # year is excluded due to extremely low significance
+lm_model <- lm(
+  net_votes ~ .,
+  Sim_Data[!names(Sim_Data) %in% exclude_from_lm]
+)
+```
+
+We now have our initial model. Upon inspection, all independent variables have extremely high variance inflation factors (VIF). VIF values of 10 or more indicate unacceptable levels of multicollinearity and should often be removed from the model.
+
+#### Variance Inflation Factors
+
+###### Table 8
+
+```{r Initial VIFs, echo = FALSE}
+pander(format(
+  as.data.frame(
+    vif(lm_model)
+    ),
+  big.mark = ",",
+  digits = 2
+  ) %>% 
+  rename(VIF = !!"vif(lm_model)"),
+  justify = c("left", "right"),
+  caption = "Variance Inflation Factors by Predictor"
+  )
+```
+
+To address this, we procedurally remove the variable with the highest VIF and recreate the model until all variables have VIF values of at least less than 10.
+
+### Removing High VIF Variables
+
+```{r Remove High VIFs}
+while (any(vif(lm_model) > 10)) {
+  exclude_from_lm %<>% c(names(which.max(vif(lm_model))))
+  lm_model <- lm(
+    net_votes ~., 
+    data = Sim_Data[!names(Sim_Data) %in% exclude_from_lm])
+}
+```
+
+#### Remaining Variables
+
+The resulting model has only two variables, each of which has a VIF of around 4.3. While not ideal, this falls within the acceptable range.
+
+###### Table 9
+
+```{r Final VIFs, echo = FALSE}
+pander(
+  as.data.frame(
+    vif(lm_model)
+    ) %>% 
+  rename(VIF = !!"vif(lm_model)"),
+  justify = c("left", "right"),
+  digits = 2,
+  caption = "Variance Inflation Factors by Remaining Predictors"
+  )
+```
+
+### Simplified Model Summary {#lm_sum}
+
+Now that we have our model, we would like to inspect its statistics and performance. Below is a summary of the multiple regression model:
+
+###### Table 10
+
+```{r Final Model Results, results='asis', echo=FALSE, warning=FALSE}
+options(scipen = 0)
+pander(summary(lm_model), digits=2, big.mark = ',')
+```
+
+
+We see that the number of households is not considered at all in this model; only the aggregate AGIs of the poorest and the wealthiest taxpayers contribute to the model. However, consider that as the number of households increase in an AGI bracket, so too does the bracket's aggregate AGI.  We also see that this model is statistically significant in predicting the margin of victory of senate elections, with F=50.586 (df=2, 196) and p=`r format(pf(50.586, 2, 196, lower.tail = FALSE), scientific = TRUE, digits =2)`.
+
+## Expansion of Multiple Regression Model
+
+In the spirit of transparency, we also conducted an analysis on all available IRS variables beyond only households and AGI. We utilized the **findCorrelation** function to remove highly correlated variables from the model. We also removed three variables that did not have statistically significant coefficients in the resulting model. The final resulting model summary is listed below in [Table 11](#exp_reg_table).
+
+```{r Full Data Model, warning=FALSE}
+IRS_Data_Exp <- IRS_Data_raw %>% 
+  pivot_wider(
+    names_from = agi_stub, 
+    id_cols = c(STATE, year), 
+    values_from = c(names(IRS_Data_raw[
+          !names(IRS_Data_raw) %in% c("STATE", "year", "agi_stub")
+          ]))) %>% 
+  as.data.frame()
+
+IRS_Data_Exp %<>% 
+  select(-c(names(
+    IRS_Data_Exp[
+      sapply(IRS_Data_Exp, is.numeric)
+      ][
+        colSums(IRS_Data_Exp[sapply(IRS_Data_Exp, is.numeric)])==0
+        ]
+    )))
+
+IRS_Data_Exp %<>% 
+  select(
+    -findCorrelation(
+      cor(IRS_Data_Exp[sapply(IRS_Data_Exp, is.numeric)]), 
+      cutoff = 0.7, 
+      names=TRUE
+      ))
+
+Data_Totals_Exp <- 
+  merge(
+    IRS_Data_Exp, 
+    Election_Data, 
+    by=c("STATE", "year")) %>% 
+  select(
+    -c("returns_with_alternative_minimum_tax_A",
+       "returns_with_additional_child_tax_credit_F",
+       "state_and_local_general_sales_tax_amount_F")
+  ) # removed due to low significance
+
+lm_model_2 <- lm(
+  net_votes ~ .,
+  Data_Totals_Exp[!names(Data_Totals_Exp) %in% 
+                    c("STATE", "year", "total_votes", "winner")])
+```
+
+###### Table 11 {#exp_reg_table}
+
+```{r Full Data Model Summary, echo=FALSE, results='asis', warning=FALSE}
+pander(summary(lm_model_2), digits=2, big.mark=',')
+options(scipen = 999)
+```
+<br>
+
+Interestingly, this model suggests that Republican candidates are overwhelmingly popular with farmers. The model suggests that for every farmer household with an AGI between \$25,000 and \$50,000, a Republican candidate will receive between 23 and 34 additional net votes.
+
+Democrats also appear to be quite popular among states with state income tax. For every household with a positive AGI less than \$25,000 that pays state income tax, a Democratic candidate will receive between 12 and 15 additional net votes.
+
+While this model has a higher R^2^ value, a lower Residual Error, and higher accuracy (`r round(sum(predict(lm_model_2,Data_Totals_Exp)*Data_Totals_Exp$net_votes > 0)*100/nrow(Data_Totals_Exp),2)`%), it is much more unintuitive and complex. For example, this model has household subtype variables (farm returns, returns with state and/or local tax) as well as variables that are required for calculating a return's AGI (capital gains and credits). For this reason, we believe the previous model is the superior model for "quick-and-easy" forecasting.
+
+## Support Vector Machine Model
+
+Finally, we will consider a support vector machine (SVM) model using all available independent variables from the IRS data set. This time, however, we will be creating a classification model, with "winner" as the target variable. We will train the model on a randomly selected subset (80%) of the data and test the model on the remaining records (20%). 
+
+```{r psuedo-random SVM}
+set.seed(123)
+
+test_rows <- sample(nrow(Data_Totals_Exp), round(0.2*nrow(Data_Totals_Exp)))
+train_set <- Data_Totals_Exp[-test_rows,-c(1,2,9,10)]
+test_set <- Data_Totals_Exp[test_rows,-c(1,2,9,10)]
+
+conf_mat <- 
+  confusionMatrix(
+    predict(
+      svm(winner ~., train_set, kernel='linear'), 
+      test_set), 
+    test_set$winner)
+
+r_svm <- data.frame(
+  lapply(
+    conf_mat$overall[c(1,3,4)], 
+    function (x) paste0(as.character(round(x[1]*100,2)),"%")
+    ))
+
+names(r_svm) <- 
+  c("Point Estimate", 
+    "Lower Bound - 95% CI", 
+    "Upper Bound - 95% CI")
+```
+
+SVMs are highly dependent on their training data. We see here that while this specific model has a `r r_svm[[1]]` accuracy rate (p = `r format(conf_mat$overall[[6]], scientific=TRUE, digits=2)`) on data it has never seen, the **confusionMatrix** function provides a 95% confidence interval of the true accuracy. [Table 12](#table12) below displays the point estimate accuracy and 95% confidence interval.
+
+###### Table 12 {#table12}
+
+```{r Display Random SVM Accuracy, echo=FALSE}
+pander(
+  r_svm, 
+  caption = "SVM Accuracy Estimates"
+  )
+```
+
+To estimate the average accuracy of an SVM trained on this data to a narrower degree, we train fifty more randomly subset SVM models.
+
+```{r Refine SVM Accuracy, cache=FALSE, warning=FALSE}
+acc_list <- c()
+
+for (i in 1:50) {
+  test_rows <- sample(nrow(Data_Totals_Exp), round(0.2*nrow(Data_Totals_Exp)))
+  train_set <- Data_Totals_Exp[-test_rows,-c(1,2,9,10)]
+  test_set <- Data_Totals_Exp[test_rows,-c(1,2,9,10)]
+  
+  acc_list %<>% c(confusionMatrix(
+    predict(
+      svm(winner ~., train_set, kernel='linear'), 
+      test_set),   
+    test_set$winner)$overall[[1]])
+}
+
+svm_p_val <- 
+  confusionMatrix(
+    predict(
+      svm(
+        winner ~., 
+        train_set, 
+        kernel='linear'), 
+      test_set),
+    test_set$winner)$overall[5:6]
+
+m_svm <- data.frame(
+  lapply(
+    c(mean(acc_list), t.test(acc_list)$conf.int[1:2]), 
+    function (x) paste0(as.character(round(x[1]*100,2)),"%")
+    ))
+
+names(m_svm) <- 
+  c("Point Estimate", 
+    "Lower Bound - 95% CI", 
+    "Upper Bound - 95% CI")
+```
+
+###### Table 13 {#table13}
+
+```{r Display Refined SVM Accuracy, echo=FALSE}
+pander(
+  m_svm, 
+  caption = "Refined SVM Accuracy Estimates"
+  )
+```
+
+[Table 13](#table13) shows that the accuracy of an SVM model trained and tested on this study's data is actually closer to `r m_svm[[1]]`. To reiterate, this means that a SVM model trained on a randomly selected subset of 80% of records will have, on average, a `r m_svm[[1]]` accuracy rate in correctly predicting a state's US Senate election when given new data.
+
+# Results
+
+In the [simplified multiple regression model summary](#lm_sum), we see that for every \$1 million increase in aggregate AGI of the poorest AGI bracket (\$1-\$25,000), the model predicts that Republican candidates would gain roughly forty votes. We also see that for every \$1,000,000 increase in the aggregate AGI  of the richest AGI bracket (over \$200,000), Republican candidates would lose roughly nine votes. This means that on average, Republican candidates gain `r format(round(lm_model$coefficients[[2]]*mean(Sim_Data[[9]]),0), big.mark=",")` net votes due to a state's poorest citizens' wealth, but lose `r format(abs(round(lm_model$coefficients[[3]]*mean(Sim_Data[[14]]),0)), big.mark=",")` net votes due to a state's richest citizens' wealth. In other words, Republican candidates gain roughly one net vote for every two of a state's poorest citizens and lose roughly five net votes for every one of a state's wealthiest citizen.
+
+This result implies that as income inequality increases, left-leaning political candidates become increasingly favored. To put this another way, as the poorest citizens lose wealth and/or the richest citizens gain wealth, Democratic candidates receive a higher proportion of the votes cast in a state's Senate election. 
+
+###### Figure 4 {#figure4}
+
+```{r Election Results Plot, echo=FALSE}
+plot_usmap(
+  data=merge(
+    data.frame(
+      year = rep(seq(2010,2020,2), each=50),
+      state = rep(state.abb, times=6)),
+      Election_Data %>% 
+      rename(state=STATE) %>% 
+      select(year, state, winner),
+    by = c("year", "state"),
+    all.x = TRUE), 
+  values="winner",
+  exclude = c("DC")) + 
+  facet_wrap(~year) + 
+  scale_fill_manual(
+    values = c("DEM"="blue", 
+               "REP"="red", 
+               "No Election" = "grey"), 
+    limits = c("DEM", "REP", "No Election / Unopposed"),
+    name = "winner") +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(title=NULL)) +
+  labs(title = "Election Results by Year")
+```
+
+
+Plots of the simplified multiple regression ([Figure 5](#figure5)) and SVM ([Figure 6](#figure6)) models' accuracies are shown below, with a plot of the true election results ([Figure 4](#figure4)) for comparison. The expanded multiple regression model's performance is omitted to prevent confusion, as their accuracies are not noticeably distinct.
+
+###### Figure 5 {#figure5}
+
+```{r Model Accuracy Map Plot, echo=FALSE}
+plot_usmap(
+  data=merge(
+    data.frame(
+      year = rep(seq(2010,2020,2), each=50),
+      state = rep(state.abb, times=6)),
+    cbind(
+      Sim_Data, 
+      lm_pred = ifelse(
+        predict(lm_model, Sim_Data) * Sim_Data$net_votes > 0, 
+        "Correct", 
+        "Wrong")
+    ) %>% 
+      rename(state=STATE) %>% 
+      select(year, state, lm_pred),
+    by = c("year", "state"),
+    all.x = TRUE
+  ) %>% mutate(
+    lm_pred = as.factor(
+      ifelse(
+        is.na(lm_pred), 
+        "No Election / Unopposed", 
+        lm_pred))), 
+  values="lm_pred",
+  exclude = c("DC")) + 
+  facet_wrap(~year) + 
+  scale_fill_manual(
+    values = c("Correct"="green", 
+               "Wrong"="orange", 
+               "No Election / Unopposed" = "grey"), 
+    limits = c("Correct", "Wrong", "No Election / Unopposed"),
+    name = "lm_pred") +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(title=NULL)) +
+  labs(title = "Simplified Multiple Regression Model",
+       subtitle = paste0("Overall Accuracy: ",
+         as.character(round(sum(
+           predict(lm_model,Sim_Data)*Sim_Data$net_votes>0
+           )*100/nrow(Sim_Data),2)),"%"))
+```
+
+###### Figure 6 {#figure6}
+
+```{r Plot SVM, echo=FALSE}
+svm_model <- svm(winner ~., train_set, kernel='linear')
+
+plot_usmap(
+  data=merge(
+    data.frame(
+      year = rep(seq(2010,2020,2), each=50),
+      state = rep(state.abb, times=6)),
+    cbind(
+      Data_Totals_Exp, 
+      svm_pred = ifelse(
+        predict(
+          svm_model, 
+          Data_Totals_Exp) == Data_Totals_Exp$winner, 
+        "Correct", 
+        "Wrong")
+    ) %>% 
+      rename(state=STATE) %>% 
+      select(year, state, svm_pred),
+    by = c("year", "state"),
+    all.x = TRUE
+  ) %>% mutate(
+    svm_pred = as.factor(
+      ifelse(
+        is.na(svm_pred), 
+        "No Election / Unopposed", 
+        svm_pred))), 
+  values="svm_pred",
+  exclude = c("DC")) + 
+  facet_wrap(~year) + 
+  scale_fill_manual(
+    values = c("Correct"="green", 
+               "Wrong"="orange", 
+               "No Election / Unopposed" = "grey"), 
+    limits = c("Correct", "Wrong", "No Election / Unopposed"),
+    name = "svm_pred") +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(title=NULL)) +
+  labs(title = "Support Vector Machine Model",
+       subtitle = paste0("Overall Accuracy: ",
+                         as.character(round(sum(
+                           predict(svm_model, Data_Totals_Exp) == 
+                             Data_Totals_Exp$winner)*100/nrow(Data_Totals_Exp),2)),"%"))
+```
+
+Like the [expanded regression model](#exp_reg_table) from earlier, the SVM model is not much more accurate than the simplified regression model. However, it is much more unintuitive as all the model's decision making takes place in its "black box," unable to be scrutinized by human eyes. Additionally, we will be unable to utilize this model without *all* required independent variables. Most importantly, this model is not significantly more accurate (p=`r format(svm_p_val[[2]], scientific=FALSE, digits=2)`) than the "No Information Rate" of the testing set (`r format(svm_p_val[[1]]*100,digits=2)`%).
+
+For comparison, the simplified model allows us to estimate how a change in a predictor would affect the margin of victory by using the predictor's coefficient. For this reason, we once again favor the simplified regression model over the SVM model for this study.
+
+# Conclusion
+
+The results of this study show that income plays a significant role in swaying US Senate elections based on a state's aggregate incomes of its poorest and richest citizens. While this study did not investigate the impact of income on an individual voter - whether through causing a voter to participate in an election or changing the party for whom the voter votes - this study showed that as income inequality increases inside the individual taxpayers' populations, the voting population will favor progressive candidates in the form of the Democratic party.
+
+# References {#ref}
+
+<div id="refs"></div>
+
+# Appendix
+
+## Packages
+
+```{r packages, eval=FALSE}
+```
+
+## Functions
+
+### Election Results Data Import {#senate}
+
+```{r senate, eval=FALSE}
+```
+
+### AGI Tables
+
+```{r agi, eval=FALSE}
+```
+
+### Independent Two Sample Tests {#t-tests}
+
+```{r t-tests, eval=FALSE}
+```
